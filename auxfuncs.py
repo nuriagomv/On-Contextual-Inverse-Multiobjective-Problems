@@ -2,41 +2,29 @@ import gurobipy as gp
 import numpy as np
 import math
 import time
+from itertools import accumulate
+from scipy.stats import spearmanr, kendalltau, wasserstein_distance
+from sklearn.metrics.pairwise import cosine_similarity
+import ot
+    
 
+def forward_problem(x_n,w,theta,
+                    A,b,gamma,
+                    d_z,K):
 
-
-def solution_callback(model, where):
-    if where == gp.GRB.Callback.MIPSOL:
-        current_time = time.time()
-        model._solution_times.append(current_time)
-        print(f"Solution found at {current_time - model._start_time:.2f} seconds")
-
-
-def function_C(x_r,w,B):
-
-    C = np.array([w[j]*x_r[j]@B[j] for j in range(len(B))])
-    #print("LINEAR CRITERIA C=\n",C)
-
-    return C
-
-
-def forward_problem(x_r,w,B,A,b,gamma,d,k,m):
-
-    C = function_C(x_r,w,B)
+    C = function_C(x_n,w,theta)
     
     #criteria-wise optimal solutions
     v_criteriawiseopt = {}
-    v = np.zeros(shape=(d,k))
-    for j in range(k):
-        model_j = gp.Model()
-        model_j.setParam('OutputFlag', 0)
-        var_v = model_j.addMVar(shape=d, lb=-float('inf'), ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="v")
-        model_j.addConstr(A@var_v<=b)
-        model_j.setObjective(C[j]@var_v, sense=gp.GRB.MINIMIZE)
-        model_j.optimize()
-        if model_j.status==2:
-            v[:,j] = var_v.X
-            v_criteriawiseopt[j] = v[:,j]
+    for k in range(K):
+        model_k = gp.Model()
+        model_k.setParam('OutputFlag', 0)
+        var_v = model_k.addMVar(shape=d_z, lb=-float('inf'), ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="v")
+        model_k.addConstr(A@var_v<=b)
+        model_k.setObjective(C[k]@var_v, sense=gp.GRB.MINIMIZE)
+        model_k.optimize()
+        if model_k.status==2:
+            v_criteriawiseopt[k] = var_v.X
         else:
             print("FAIL IN CRITERIA-WISE OPTIMAL SOLUTIONS")
             return None
@@ -44,22 +32,21 @@ def forward_problem(x_r,w,B,A,b,gamma,d,k,m):
     #forward model
     model = gp.Model()
     model.setParam('OutputFlag', 0) #disabling solver output
-    model.setParam("NonConvex",2)
-
-    z = model.addMVar(shape=d, lb=-float('inf'), ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="z")
+    z = model.addMVar(shape=d_z, lb=-float('inf'), ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="z")
     model.addConstr( A @ z <= b, name='z in Z') 
 
     if gamma == "l_1":
-        model.setObjective(expr = gp.quicksum(C[j]@z for j in range(k)), sense=gp.GRB.MINIMIZE)
+        model.setObjective(expr = gp.quicksum(C[k]@z for k in range(K)), sense=gp.GRB.MINIMIZE)
     else:
-        t = model.addMVar(shape=(1), lb = 0, ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="obj_fun_value")
+        t = model.addMVar(shape=1, lb = 0, ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="obj_fun_value")
         model.setObjective(expr = t, sense=gp.GRB.MINIMIZE)
-
+        """
         if gamma == "l_inf":
             model.addConstrs((C[j]@(z-v[:,j]) <= t
                               for j in range(k)), name="aux")
+        """
         if gamma == "l_2":
-            model.addConstr(gp.quicksum((C[j]@(z-v[:,j]))*(C[j]@(z-v[:,j])) for j in range(k)) <=t**2, name="aux")
+            model.addConstr(gp.quicksum((C[k]@(z-v_criteriawiseopt[k]))*(C[k]@(z-v_criteriawiseopt[k])) for k in range(K)) <=t**2, name="aux")
     
     model.update()
     model.optimize()
@@ -71,67 +58,62 @@ def forward_problem(x_r,w,B,A,b,gamma,d,k,m):
         return None, None, model
 
 
-def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
-                    gamma,
-                    objfun,
-                    timelimit = None,
-                    solve_to = "optimality",
-                    sparsity_constraints = None, 
-                    matrix_norm ="l_2",
-                    check_feasibility_orig = None,
-                    tol=0.,
-                    general_case=False):
+def function_C(x_n,w,B):
 
-    #print("SOLVE TO ",solve_to,", gamma=",gamma, ". Sparsity=",sparsity)
-    
+    C = np.array([w[k]*x_n[k]@B[k] for k in range(len(B))])
+    #print("LINEAR CRITERIA C=\n",C)
+    return C
+
+
+def inverse_problem(N, x, optimal_z, list_A, b, 
+                    d_x, d_x_k, d_z, m, K,
+                    gamma,
+                    objfun, timelimit, solve_to, 
+                    general_case,
+                    prior = None,
+                    check_feasibility_orig = None,
+                    tol = 0.,
+                    pista = False):
+
     model = gp.Model()
     model.setParam("NonConvex",2)
-    if check_feasibility_orig is None:
+    model.setParam(gp.GRB.Param.TimeLimit, timelimit)
+    if solve_to == "feasibility":
+        #https://support.gurobi.com/hc/en-us/community/posts/6841043701265-How-Gurobi-solves-a-optimisation-problem-that-doesn-t-have-an-objective
+        model.setParam(gp.GRB.Param.SolutionLimit, 1) #To find a feasible solution quickly, Gurobi executes additional feasible point heuristics when the solution limit is set to exactly 1.
 
-        if timelimit is not None:
-            model.setParam(gp.GRB.Param.TimeLimit, timelimit)
-
-        if solve_to =="feasibility":
-            #https://support.gurobi.com/hc/en-us/community/posts/6841043701265-How-Gurobi-solves-a-optimisation-problem-that-doesn-t-have-an-objective
-            model.setParam(gp.GRB.Param.SolutionLimit, 1) #To find a feasible solution quickly, Gurobi executes additional feasible point heuristics when the solution limit is set to exactly 1.
-        else: #optimality y guarda las feasible en el camino
-            model.setParam(gp.GRB.Param.PoolSearchMode, 1) #https://www.gurobi.com/documentation/current/refman/finding_multiple_solutions.html
-            model.setParam(gp.GRB.Param.PoolSolutions, 5) 
-
-    else:
-        print("checkeo factibilidad con tolerancia tol=",tol)
-        model.setParam('OutputFlag', 0) #disabling solver output
-    
     #inverse matrices to find
-    B_tilde = {}
-    for j in range(k):
+    theta_tilde = {}
+    for k in range(K):
         if check_feasibility_orig is None:
             lowerb, upperb = -1, 1
         else:
-            (w_orig,B_orig) = check_feasibility_orig
-            bound = w_orig[j]*B_orig[j] # https://support.gurobi.com/hc/en-us/community/posts/4405152437777-Use-Gurobi-to-check-a-solution-feasibility
+            model.setParam('OutputFlag', 0) #disabling solver output
+            (w_orig,theta_orig) = check_feasibility_orig
+            bound = w_orig[k]*theta_orig[k] # https://support.gurobi.com/hc/en-us/community/posts/4405152437777-Use-Gurobi-to-check-a-solution-feasibility
             lowerb, upperb = bound, bound
-        B_tilde[j] = model.addMVar(shape=(n_j[j],d), lb=lowerb, ub=upperb, vtype=gp.GRB.CONTINUOUS, name="B_tilde_"+str(j))
-        B_tilde[j].PoolIgnore = 1
-    C_rj = np.array([[x[j][r]@B_tilde[j] for j in range(k)] for r in range(R)]) #pedir como C_rj[r][j] y ese elemento es un vector fila de dimension d
+        theta_tilde[k] = model.addMVar(shape=(d_x_k[k],d_z), 
+                                       lb=lowerb, ub=upperb, 
+                                       vtype=gp.GRB.CONTINUOUS, name="theta_tilde_"+str(k))
+    C_nk = np.array([[x[n][k]@theta_tilde[k] for k in range(K)] for n in range(N)]) #pedir como C_nk[n][k] y ese elemento es un vector fila de dimension d_z
 
-    #sum of norms equal to one
-    if matrix_norm == "l_2":
-        norma_Btilde = model.addMVar(shape=(k), lb = 0., ub=1., vtype=gp.GRB.CONTINUOUS, name="norma_Btilde")
-        norma_Btilde.PoolIgnore = 1 #https://support.gurobi.com/hc/en-us/community/posts/13808172554129-PoolSearchMode-2-return-the-same-solutions
-        if tol==0.:
-            model.addConstr(gp.quicksum(norma_Btilde[j] for j in range(k)) == 1, name="unit_SumNorm")
-        else:
-            model.addConstr(gp.quicksum(norma_Btilde[j] for j in range(k)) <= 1+tol, name="Uunit_SumNorm")
-            model.addConstr(gp.quicksum(norma_Btilde[j] for j in range(k)) >= 1-tol, name="Lunit_SumNorm")
-        model.addConstrs((norma_Btilde[j]**2 == gp.quicksum(B_tilde[j][p][q]**2 for p in range(n_j[j]) for q in range(d))
-                          for j in range(k)), name="define_norm**2")
+    #AYUDA PARA MI PROBLEMA DE PORTFOLIO
+    if pista:
+        model.addConstr(theta_tilde[0][:,-1] == np.zeros(d_x_k[0]))
+        model.addConstr(theta_tilde[1][:,:-1] == np.zeros(d_z-1))
+
+
+    #NORMALIZATION CONSTRAINT
+    norms = model.addMVar(shape=K, lb = 0., ub=1., vtype=gp.GRB.CONTINUOUS, name="norms")
+    if tol == 0.:
+        model.addConstr(gp.quicksum(norms[k] for k in range(K)) == 1, name="unit_SumNorm")
     else:
-        if matrix_norm == "l_1":
-            None
-        if matrix_norm == "l_inf":
-            None
+        model.addConstr(gp.quicksum(norms[k] for k in range(K)) <= 1+tol, name="unit_SumNorm_U")
+        model.addConstr(gp.quicksum(norms[k] for k in range(K)) >= 1-tol, name="unit_SumNorm_L")
+    model.addConstrs((norms[k]**2 == gp.quicksum(theta_tilde[k][j][q]**2 for j in range(d_x_k[k]) for q in range(d_z))
+                        for k in range(K)), name="define_norm**2")
 
+    """
     #criteria-wise optimal solutions
     # VER CUÁNDO ES OMITIBLE
     if not ((gamma == "l_1") and (objfun == "min_nonzeros")): #solo omitible para el caso l_1 a maximizar sparsity
@@ -155,17 +137,49 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
         #weak and strong duality
         model.addConstrs((C_rj[r][j]@v[:,j,r] <= u[:,j,r]@b
                             for j in range(k) for r in range(R)), name="equal_objval")
-
+    """
     #consistency of each optimal solution in the sample r=1,...,R
+    mu = model.addMVar(shape=(m,N), 
+                       lb=0, ub=float('inf'), 
+                       vtype=gp.GRB.CONTINUOUS, name="mu")
+    for n in range(N):
+        if tol == 0.:
+            model.addConstrs((mu[i,n]*(list_A[n][i,:]@optimal_z[n]-b[i])==0 for i in range(m)), name='consistency-l1_a_'+str(n))
+        else:
+            model.addConstrs((mu[i,n]*(list_A[n][i,:]@optimal_z[n]-b[i])<=0+tol for i in range(m)), name='U_consistency-l1_a_'+str(n))
+            model.addConstrs((mu[i,n]*(list_A[n][i,:]@optimal_z[n]-b[i])>=0-tol for i in range(m)), name='L_consistency-l1_a_'+str(n))
+    
     if gamma=="l_1":
-        mu = model.addMVar(shape=(m,R), lb=-float('inf'), ub=0, vtype=gp.GRB.CONTINUOUS, name="mu")
-        mu.PoolIgnore = 1
-        for r in range(R):
-            aux_vect_C = np.array([gp.quicksum(C_rj[r][j][q] for j in range(k)) for q in range(d)])
-            model.addConstrs(((np.transpose(A)@mu[:,r])[q] == aux_vect_C[q]
-                              for q in range(d)), name='consistency-l1_a_'+str(r))
-            model.addConstr(np.transpose(aux_vect_C)@optimal_z[r] <= mu[:,r]@b, name='consistency-l1_b_'+str(r) )
-
+        for n in range(N):
+            aux_vect_C = np.array([gp.quicksum(C_nk[n][k][q] for k in range(K)) for q in range(d_z)])
+            model.addConstrs((-aux_vect_C[q] == (np.transpose(list_A[n])@mu[:,n])[q]
+                              for q in range(d_z)), name='consistency-l1_b_'+str(n))
+    if gamma == "l_2":
+        y = model.addMVar(shape=(m,K,N), 
+                          lb = -float('inf'), ub = 0.,
+                          vtype=gp.GRB.CONTINUOUS, name="y_optcriteriawise")
+        for n in range(N):
+            if tol ==0.:
+                model.addConstrs((np.transpose(list_A[n])@y[:,k,n] == x[n][k]@theta_tilde[k]
+                                for k in range(K)))
+            else:
+                model.addConstrs((np.transpose(list_A[n])@y[:,k,n] <= x[n][k]@theta_tilde[k] +tol
+                                for k in range(K)))
+                model.addConstrs((np.transpose(list_A[n])@y[:,k,n] >= x[n][k]@theta_tilde[k] -tol
+                                for k in range(K)))
+            aux_vect_C_l2 = np.array([gp.quicksum(C_nk[n][k][q] * (x[n][k]@theta_tilde[k]@optimal_z[n] - y[:,k,n]@b)
+                                                  for k in range(K))
+                                      for q in range(d_z)])
+            if tol ==0.:
+                model.addConstrs((-aux_vect_C_l2[q] == (np.transpose(list_A[n])@mu[:,n])[q]
+                                for q in range(d_z)), name='consistency-l1_b_'+str(n))
+            else:
+                model.addConstrs((-aux_vect_C_l2[q] <= (np.transpose(list_A[n])@mu[:,n])[q]+tol
+                                for q in range(d_z)), name='consistency-l1_b_'+str(n))
+                model.addConstrs((-aux_vect_C_l2[q] >= (np.transpose(list_A[n])@mu[:,n])[q]-tol
+                                for q in range(d_z)), name='consistency-l1_b_'+str(n))
+        
+    """
     else:
         mu = model.addMVar(shape=(m,R), lb=0, ub=float('inf'), vtype=gp.GRB.CONTINUOUS, name="mu")
         mu.PoolIgnore = 1
@@ -186,15 +200,6 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
                               for r in range(R) for i in range(m)), name='consistency-linf_d')
 
         if gamma=="l_2":
-            """
-            #CREO QUE ESTABA MAL PORQUE NO PILLABA BIEN EL NP.TRANSPOSE, al menos está escrito más claro
-            #-np.transpose(C_rj[r])@np.array([((C_rj[r][j])@optimal_z[r] + d_optval[j,r]) for j in range(k)]) 
-            #arreglado:
-            #model.addConstrs((-np.array([gp.quicksum(C_rj[r][j][q]*((C_rj[r][j])@optimal_z[r] + d_optval[j,r]) for j in range(k)) for q in range(d)]) == gp.quicksum(mu[i,r]*A[i,:] for i in range(m))
-             #                 for r in range(R)), name='consistency-l2_a')
-            # es equivalente a lo anterior:
-            #-np.array([np.array([C_rj[r][j][q] for j in range(k)])@np.array([(C_rj[r][j])@optimal_z[r] + d_optval[j,r] for j in range(k)]) for q in range(d)])
-            """
             model.addConstrs((-gp.quicksum(C_rj[r][j][q]*((C_rj[r][j])@optimal_z[r] + d_optval[j,r]) for j in range(k)) == gp.quicksum(mu[i,r]*A[i,:] for i in range(m))[q]
                               for r in range(R) for q in range(d)), name='consistency-l2_a')
             if tol==0.:
@@ -205,7 +210,8 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
                                   for r in range(R) for i in range(m)), name="Uconsistency-l2_b")
                 model.addConstrs((mu[i,r]*(A[i,:]@optimal_z[r] -b[i]) >= 0 -tol
                                   for r in range(R) for i in range(m)), name="Lconsistency-l2_b")
-
+    """
+    """
     #general case
     if general_case:
         eta = model.addMVar(shape = (n_j[0],k), vtype=gp.GRB.BINARY, name="eta")
@@ -239,23 +245,6 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
         model.addConstrs((varphi[s,j] <= varphi[s-1,j] + eta[s,j]
                           for s in range(1,n_j[0]) for j in range(k)), name="def_s1")
 
-
-        """
-        #variable contador auxiliar
-        phi_aux_s = model.addMVar(shape=(n_j[0]+1), vtype=gp.GRB.INTEGER, name="phi_aux_s")
-        model.addConstr(phi_aux_s[0] == 0, name="phi_aux_0_value")
-        model.addConstrs((phi_aux_s[s+1] == gp.quicksum((j+1)*phi[s,j] for j in range(k)) 
-                          for s in range(n_j[0])), name="phi_aux_s_value")
-        model.addConstrs((phi_aux_s[s-1] <= phi_aux_s[s]
-                          for s in range(1,n_j[0]+1)), name="conteo_s_inf")
-        model.addConstrs((phi_aux_s[s] <= phi_aux_s[s-1] + 1
-                          for s in range(1,n_j[0]+1)), name="conteo_s_sup")
-
-        model.addConstrs((phi_aux_s[s+1] == gp.quicksum(varphi[s,j] for j in range(k)) 
-                          for s in range(n_j[0])), name="phi_aux_s_value")
-        
-        """
-        
         model.addConstrs((gp.quicksum((j+1)*phi[s,j] for j in range(k)) == gp.quicksum(varphi[s,j] for j in range(k)) 
                           for s in range(n_j[0])), name="equiv")
         
@@ -264,9 +253,28 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
                           for s in range(1,n_j[0])), name="conteo_s_inf")
         model.addConstrs((gp.quicksum(varphi[s,j] for j in range(k)) <= 1 + gp.quicksum(varphi[s-1,j] for j in range(k))
                           for s in range(1,n_j[0])), name="conteo_s_sup")
-        
+    """    
 
     #OBJECTIVE FUNCTION
+    expression = 0.
+    for (lamb, obj) in objfun.items():
+        if obj == "min_prior" and lamb>0.:
+            if prior is not None:
+                #expression = gp.quicksum((theta_tilde[k][j,q]-prior[k][j,q])**2 for k in range(K) for j in range(d_x_k[k]) 
+                expression += lamb*gp.quicksum((theta_tilde[k][j,q]- norms[k]*prior[k][j,q])**2 for k in range(K) for j in range(d_x_k[k]) 
+                                               for q in range(d_z))
+        if obj == "max_sparsity" and lamb>0.:
+            delta = {}
+            K=1#SOLO SPARSITY PRIMERA MATRIZ
+            for k in range(K):
+                delta[k] = model.addMVar(shape=(d_x_k[k],d_z), vtype=gp.GRB.BINARY, name="sparse_entries")
+            #NO CUENTO SPARSITY ÚLTIMA COLUMNA
+            model.addConstrs((theta_tilde[k][j,q] <= delta[k][j,q] for k in range(K) for j in range(d_x_k[k]) for q in range(d_z-1)))#range(d_z)))
+            model.addConstrs((-theta_tilde[k][j,q] <= delta[k][j,q] for k in range(K) for j in range(d_x_k[k]) for q in range(d_z-1)))#range(d_z)))
+            expression += lamb*gp.quicksum(delta[k][j,q] for k in range(K) for j in range(d_x_k[k]) for q in range(d_z))
+
+    model.setObjective(expr = expression, sense=gp.GRB.MINIMIZE)
+    """
     if objfun == "min_distideal":
         if gamma == "l_1":
             model.setObjective(expr = 1/R * gp.quicksum(C_rj[r][j]@(optimal_z[r]-v[:,j,r]) for j in range(k) for r in range(R)), sense=gp.GRB.MINIMIZE)
@@ -295,16 +303,6 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
                             for j in range(k) for p in range(n_j[j]) for q in range(d)), name='Uabs')
         model.addConstrs((B_tilde[j][p][q] >= -delta[j][p,q]
                             for j in range(k) for p in range(n_j[j]) for q in range(d)), name='Labs')
-        """
-        model.addConstrs((B_tilde[j][p][q] <= l[j][p]
-                            for j in range(k) for p in range(n_j[j]) for q in range(d)), name='abs11')
-        model.addConstrs((B_tilde[j][p][q] >= -l[j][p]
-                            for j in range(k) for p in range(n_j[j]) for q in range(d)), name='abs21')
-        model.addConstrs((B_tilde[j][p][q] <= c[j][q]
-                            for j in range(k) for p in range(n_j[j]) for q in range(d)), name='abs12')
-        model.addConstrs((B_tilde[j][p][q] >= -c[j][q]
-                            for j in range(k) for p in range(n_j[j]) for q in range(d)), name='abs22')
-        """
         
         if objfun == "min_nonzeros":
             model.setObjective(expr = gp.quicksum(delta[j][p,q]
@@ -329,28 +327,18 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
                 model.addConstrs((gp.quicksum(l[j]) <= N_A[j] for j in range(k)), name='total_rows')
             if N_V is not None:
                 model.addConstrs((gp.quicksum(c[j]) <= N_V[j] for j in range(k)), name='total_columns')
-           
+
+    if objfun == "min_prior":
+        model.setObjective(expr = gp.quicksum((B_tilde[j][p,q]-prior[j][p,q])**2 for j in range(k) for p in range(n_j[j]) for q in range(d)), 
+                           sense=gp.GRB.MINIMIZE)
+    """
 
     model.update()
-    #model.write('model.lp')
-    try:
-        # Initialize the list to store solution times and start time
-        model._solution_times = []
-        model._start_time = time.time()
-        model.optimize(solution_callback)
-    except:
-        print("An error ocurred")
-
+    model.optimize()
+    
     if check_feasibility_orig is not None:
         if model.status == 2:
             print('THE ORIGINAL (w,B) IS A FEASIBLE SOLUTION OF MY INVERSE PROBLEM')
-            """
-            for j in range(k):
-                vars['B_tilde'][j].X.round(3)
-                w_orig[j]*B_orig[j].round(3)
-                print("")
-            """
-        
         else: #https://www.gurobi.com/documentation/current/refman/optimization_status_codes.html#sec:StatusCodes
             print('THE ORIGINAL (w,B) IS NOT A FEASIBLE SOLUTION OF MY INVERSE PROBLEM')
             orignumvars = model.NumVars
@@ -381,23 +369,54 @@ def inverse_problem(x,optimal_z, A,b, d,k,m,n_j,R,
             else:
                 print('THE ORIGINAL (w,B) IS NOT A FEASIBLE SOLUTION OF MY INVERSE PROBLEM EVEN IF RELAXING IT')
 
-    return model, B_tilde
+    return model, theta_tilde
 
 
-def return_estimates(B_estimates):
+def return_estimates(theta_estimates):
     
     print("\n PARAMETROS BUSCADOS:")
-    B_inv = {}
+    theta_inv = {}
     w_inv = []
-    j = 0
-    for B_estimate in B_estimates:
-        w_inv_j = np.sqrt(np.sum([b**2 for b in B_estimate])) #por defecto uso matrix_norm==l2
-        w_inv.append(w_inv_j)
-        B_inv[j] = B_estimate/w_inv_j if w_inv_j !=0 else B_estimate
-        print("B_inv_",j,"=\n", B_inv[j])
-        j+=1
+    k = 0
+    for theta in theta_estimates:
+        w_inv_k = np.sqrt(np.sum([t**2 for t in theta])) #por defecto uso matrix_norm==l2
+        w_inv.append(w_inv_k)
+        theta_inv[k] = theta/w_inv_k if w_inv_k !=0 else theta
+        print("theta_inv_",k,"=\n", theta_inv[k])
+        k+=1
     print("w_inv=", w_inv)
-    return np.array(w_inv), B_inv
+    return np.array(w_inv), theta_inv
+
+
+def eval_estimates(w_inv, theta_inv, w_orig, theta_orig, x_test,N,N_test):
+
+    #preferences
+    if len(w_orig) ==2:
+        bins = range(len(w_orig))
+        #https://medium.com/@srivastava.abh/earth-mover-distance-88dfa03ae9cb
+        emd = wasserstein_distance(u_values = bins, v_values = bins, u_weights = w_orig, v_weights = w_inv)
+        #emd = wasserstein_distance(w_orig, w_inv)
+    else:
+        M = 1 - np.eye(len(w_orig))
+        emd = ot.emd2(w_orig, w_inv, M)
+
+    #objectives x*theta
+    cos_sims = {}
+    for k in range(len(theta_orig)):
+        cos_sim = []
+        for n in range(N,N+N_test):
+            cos_sim.append( cosine_similarity((x_test[n][k]@theta_orig[k]).reshape(1, -1),
+                                         (x_test[n][k]@theta_inv[k]).reshape(1, -1))[0][0]
+            )
+        cos_sims[k] = (np.mean(cos_sim),np.std(cos_sim),np.median(cos_sim))
+    
+    return emd, cos_sims
+    
+
+
+##########################
+
+
 
 
 def val_fobj_forward(x_r,k,w,B,gamma,z, vect_vs):
@@ -426,7 +445,8 @@ def values_for_gap_or_consistency(gamma, k,
     return (val_orig, val_inv)
 
 
-def checkeo_sols(R,R_test, gamma, d, m, n, n_j, k, A,b,
+def checkeo_sols(R,R_test, gamma, d, m, n, n_j, k, 
+                 list_A,b,
                  w_inv, B_inv,#vars,
                  w_orig,B_orig,
                  x, optimal_z,opt_criteriawise_v,
@@ -436,8 +456,8 @@ def checkeo_sols(R,R_test, gamma, d, m, n, n_j, k, A,b,
     consistencys = []
     suboptimalitygaps_in = []
     for r in range(R):
-        x_r = [x[j][r] for j in range(k)]
-        z_r_inv, opt_criteriawise_v_inv, model_inv = forward_problem(x_r,w_inv,B_inv,A,b,gamma,d,k,m)
+        x_r = [x[r][j] for j in range(k)]
+        z_r_inv, opt_criteriawise_v_inv, model_inv = forward_problem(x_r,w_inv,B_inv,list_A[r],b,gamma,d,k)
         if z_r_inv is None:
             print("For r=",r," couldn't solve the forward problem with the inverse parameters")
             continue
@@ -464,9 +484,9 @@ def checkeo_sols(R,R_test, gamma, d, m, n, n_j, k, A,b,
 
     # EL SUBOPTIMALITY GAP VA MEDIDO EVALUANDO BAJO LOS PARÁMETROS ORIGINALES
     suboptimalitygaps_out = []
-    for r in range(R_test):
-        x_r = [x_test[j][r] for j in range(k)]
-        z_r_inv, opt_criteriawise_v_inv, _ = forward_problem(x_r,w_inv,B_inv,A,b,gamma,d,k,m)
+    for r in range(R,R+R_test):
+        x_r = [x_test[r][j] for j in range(k)]
+        z_r_inv, opt_criteriawise_v_inv, _ = forward_problem(x_r,w_inv,B_inv,list_A[r],b,gamma,d,k)
         if z_r_inv is None:
             print("For r_test=",r," couldn't solve the forward problem with the inverse parameters")
             continue
@@ -483,8 +503,10 @@ def checkeo_sols(R,R_test, gamma, d, m, n, n_j, k, A,b,
     if not consistency_achieved:
         print("Error in consistency")
     
-    print("median fractional suboptimality gap in sample: ",np.nanmedian([compute_gap(a,b) for (a,b) in suboptimalitygaps_in]))
-    print("median fractional suboptimality gap out sample: ",np.nanmedian([compute_gap(a,b) for (a,b) in suboptimalitygaps_out]))
+    med_in = np.nanmedian([compute_gap(a,b) for (a,b) in suboptimalitygaps_in])
+    med_out = np.nanmedian([compute_gap(a,b) for (a,b) in suboptimalitygaps_out])
+    print("median fractional suboptimality gap in sample: ",med_in)
+    print("median fractional suboptimality gap out sample: ",med_out)
     
 
     return consistency_achieved, suboptimalitygaps_in,suboptimalitygaps_out

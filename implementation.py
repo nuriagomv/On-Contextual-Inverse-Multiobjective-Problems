@@ -1,178 +1,206 @@
 import os
 #os.chdir(r'/Users/nuriagomezvargas/Library/CloudStorage/OneDrive-UNIVERSIDADDESEVILLA/Académico/PhDiva/Inverse Multiobjective Optimization')
-
 import numpy as np
+np.set_printoptions(suppress=True,precision=3)
 import auxfuncs as aux
-from instances import all_components_of_instances
+from data_stocks import get_real_portfolio_instances
 import pickle
 import pandas as pd
-import gurobipy as gp
-import math
+#import gurobipy as gp
+#from sklearn.cluster import KMeans
+from sklearn_extra.cluster import KMedoids
+#import math
+import random
+import time
 
-def executeIO_with_parameters(seed, R,R_test,gamma, timelimit,objfun, solve_to,sparsity_constraints, general_case):
 
-    print('\n\n\nEXPERIMENT: ',(seed, R,R_test,gamma))#,solve_to,sparsity))
 
-    #INSTANCES
-    instances = all_components_of_instances(R,R_test,gamma, seed)
-    n_j,n,k,m,d,A,b,w_orig,B_orig, x_total,optimal_z_total,opt_criteriawise_v_total, x,x_test, optimal_z, optimal_z_test, opt_criteriawise_v, opt_criteriawise_v_test = instances
+
+def executeIO(seed, N, N_test, n_stocks, n_market,
+              timelimit = 1800, objfun = {1.:"min_prior"}, solve_to = "optimality",
+              start = "2024-01-01", end = "2024-12-31", 
+              pista = True,
+              what_in_context = "past_t-1", volume_in_objective = False,
+              gamma = "l_1", tol = 0.,
+              noise = False, general_case = False,
+              sparse_model = True):
     
-    if general_case:
-        x_general = []
-        for r in range(R):
-            x_complete = np.concatenate([x[j][r] for j in range(k)],axis=0)
-            x_general.append(x_complete)
-        x_general_test = []
-        for r in range(R_test):
-            x_complete = np.concatenate([x_test[j][r] for j in range(k)],axis=0)
-            x_general_test.append(x_complete)
-        for j in range(k):
-            x[j] = np.array(x_general)
-            x_test[j] = np.array(x_general_test)
-            B_orig[j] = np.concatenate([np.zeros((n_j[l],d)) if l!=j else B_orig[l] for l in range(k)], axis=0)    
-        n_j = np.repeat(np.sum(n_j), len(n_j))
-        #ME FALTA HACERLO CON EL TEST 
-        instances = n_j,n,k,m,d,A,b,w_orig,B_orig, x_total,optimal_z_total,opt_criteriawise_v_total, x,x_test, optimal_z, optimal_z_test, opt_criteriawise_v, opt_criteriawise_v_test
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    #INSTANCES
+    instances = get_real_portfolio_instances(seed, n_stocks, n_market,
+                                             N, N_test, gamma, 
+                                             noise,
+                                             start, end,
+                                             what_in_context, volume_in_objective,
+                                             sparse_model)
+    (data_final, stocks, market_features), (d_x,d_x_k,d_z,m,K), (w_orig,theta_orig), (list_A,b), (x,x_test), (optimal_z,optimal_z_test), (opt_criteriawise_v,opt_criteriawise_v_test) = instances.values()
+    
+
+    print("w_orig:", w_orig)
+    print("theta_orig_0:\n", theta_orig[0])
+    percentage_zeros_orig = (np.sum(theta_orig[0][:,:-1]==0))/np.prod((theta_orig[0][:,:-1]).shape)
+    #VARIABILIDAD DE SOLUCIONES
+    unique_z = list(set(tuple(sublist) for sublist in optimal_z.values()))
+    #for z in unique_z:
+     #   print(np.array(z).round(2))
+    n_unique_z = len(unique_z)
+    
+    unique_x = list(set(tuple(sublist[0]) for sublist in x.values()))
+    #for x_1 in unique_x:
+     #  print(np.array(x_1).round(2))
+    n_unique_x = len(unique_x)
+
+
 
     # INVERSE PROBLEM
     print('\n -----------------------------------------------------\nINVERSE PROBLEM')
-    #check feasibility of original (w,B)
-    _, _ = aux.inverse_problem(x,optimal_z, A,b,d,k,m,n_j,R, gamma, objfun=None,
-                               check_feasibility_orig = (w_orig, B_orig), tol = 1e-2 if gamma=="l_2" else 0.)
+    #check feasibility of original (w,theta)
+    _, _ = aux.inverse_problem(N, x, optimal_z, list_A, b, d_x, d_x_k, d_z, m, K,
+                               gamma, {1:0.}, timelimit, solve_to,
+                               general_case,
+                               check_feasibility_orig = (w_orig, theta_orig),
+                               tol=tol)
     
     #solve to find inverse estimates
-    model, B_tilde = aux.inverse_problem(x,optimal_z, A,b,d,k,m,n_j,R, gamma,
-                                         objfun = objfun,
-                                         timelimit = timelimit,
-                                         solve_to = solve_to,
-                                         sparsity_constraints = sparsity_constraints,
-                                         general_case = general_case)
-
-    return instances, model, B_tilde
-
-
-def retrieve_solutions(instances, model, B_tilde, dict_execution):
-
-    n_j,n,k,m,d,A,b,w_orig,B_orig, x_total,optimal_z_total,opt_criteriawise_v_total, x,x_test, optimal_z, optimal_z_test, opt_criteriawise_v, opt_criteriawise_v_test = instances
-    unique_solutions = set()
-    #https://www.gurobi.com/documentation/current/refman/retrieving_solutions.html
-    # Loop through the solutions and print them
-    for i in range(model.SolCount):
-        model.setParam(gp.GRB.Param.SolutionNumber, i)
-        solution = tuple(np.concatenate([B.Xn.flatten() for B in B_tilde.values()]))#tuple(v.Xn for v in model.getVars())
-        if solution not in unique_solutions:
-            unique_solutions.add(solution)
-            print(f"\nSolution {i}:", solution)
-            time_sol_i = model._solution_times[i] - model._start_time
-            print(f"Solution {i} found at {time_sol_i:.2f} seconds with objval={model.PoolObjVal:.0f}")
-            B_estimates = [B.Xn for B in B_tilde.values()]
-            #print(B_estimates)
-            w_inv, B_inv = aux.return_estimates(B_estimates)
-
-            #veo cual ha sido la sparsity efectiva
-            N_T_efect = np.sum(w_inv>0)
-            N_A_efect = [np.sum([any(B_inv[j][p,:] !=0) for p in range(n_j[j])]) for j in range(k)]
-            N_V_efect = [np.sum([any(B_inv[j][:,q] !=0) for q in range(d)]) for j in range(k)]
-            sparsity_effective =  (N_T_efect, N_A_efect, N_V_efect)
-
-            consistency_achieved, suboptimalitygaps_in, suboptimalitygaps_out = aux.checkeo_sols(R,R_test, gamma, d, m, n, n_j, k, A,b,
-                                                                                                    w_inv, B_inv,
-                                                                                                    w_orig,B_orig,
-                                                                                                    x, optimal_z,opt_criteriawise_v,
-                                                                                                    x_test, optimal_z_test,opt_criteriawise_v_test)
-            dict_execution['solutions'][i] = {'obj_val': model.PoolObjVal,
-                                                'time_found': time_sol_i,
-                                                'w_inv': w_inv, 'B_inv': B_inv,
-                                                'consistecy_achieved': consistency_achieved,
-                                                'mean_suboptimalitygap_out': np.mean([b-a for (a,b) in suboptimalitygaps_out]),
-                                                'median_suboptimalitygap_out': np.median([b-a for (a,b) in suboptimalitygaps_out]),
-                                                'mean_suboptimalitygap_out_frac': np.nanmean([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_out]),
-                                                'median_suboptimalitygap_out_frac': np.nanmedian([aux.compute_gap(a,b)  for (a,b) in suboptimalitygaps_out]),
-                                                'mean_suboptimalitygap_in_frac': np.nanmean([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_in]),
-                                                'median_suboptimalitygap_in_frac': np.nanmedian([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_in]),
-                                                'suboptimalitygaps_in': suboptimalitygaps_in,
-                                                'suboptimalitygaps_out': suboptimalitygaps_out}
+    #objfun = {0.9: "min_prior", .1:"max_sparsity"}
+    prior = {}
+    for k in range(K):
+        #prior[k] = w_orig[k]*theta_orig[k] + np.random.uniform(-0.05,0.05,size = theta_orig[k].shape)
+        prior[k] = theta_orig[k] + np.random.uniform(-0.25,0.25,size = theta_orig[k].shape)
+        prior[k] *= np.random.randint(0,2,size=prior[k].shape)
     
-    return dict_execution
+    if noise:
+        L = 5
+        #DEBERIA HACER CLUSTER SOLO DE  X_1
+        x_all = [np.concatenate(tuple(x[n])) for n in range(N)]
+        kmedoids = KMedoids(n_clusters = L, random_state=seed)
+        kmedoids.fit(np.array(x_all))
+        # Get centroids
+        centroids = kmedoids.cluster_centers_
+        print("Centroids:\n", centroids) 
+        """
+        labels = kmedoids.labels_
+        clusters = np.zeros((R,L))
+        for r in range(R):
+            clusters[r,labels[r]] = 1.
+        """
+        subset = []
+        for c in centroids:
+            subset+=[n for n in range(N) if (x_all[n] ==c).all()]
+        x_meds,z_opt_meds, n_meds = {},{},0
+        for n in range(N):
+            if n in subset:
+                x_meds[n_meds],z_opt_meds[n_meds] = x[n],optimal_z[n]
+                n_meds+=1
+        model, theta_tilde = aux.inverse_problem(n_meds, x_meds, z_opt_meds,
+                                                 A, b, d_x, d_x_k, d_z, m, K,
+                                                 gamma, objfun, timelimit, solve_to,
+                                                 general_case,
+                                                 prior=prior,
+                                                 tol=0.0005)
+
+    inicio = time.time()
+    model, theta_tilde = aux.inverse_problem(N, x, optimal_z, list_A, b, d_x, d_x_k, d_z, m, K,
+                                             gamma, objfun, timelimit, solve_to,
+                                             general_case,
+                                             prior=prior,
+                                             tol=tol,
+                                             pista = pista)
+    tiempo = time.time()-inicio
+    MIP_gap = model.MIPGap
+
+    w_inv, theta_inv = aux.return_estimates([theta.X for theta in theta_tilde.values()])
+
+    emd, cos_sims = aux.eval_estimates(w_inv, theta_inv, w_orig, theta_orig, 
+                                       x_test,N,N_test) #YA CORREGIDO 
+    #COS_SIMS ES (MEDIA,STD,MEDIAN)
+    
+    #n_sparse_coefs = np.sum([t == 0 for t in theta_inv[0]]) - d_x_k[0]
+
+    consistency_achieved, suboptimalitygaps_in, suboptimalitygaps_out = aux.checkeo_sols(N, N_test, gamma, d_z, m, d_x, d_x_k, K, 
+                                                                                         list_A,b,
+                                                                                                    w_inv, theta_inv,
+                                                                                                    w_orig, theta_orig,
+                                                                                                    x, optimal_z,opt_criteriawise_v,
+                                                                                                    x_test, optimal_z_test,opt_criteriawise_v_test)                                                                                  
+
+    return tiempo, MIP_gap, instances, percentage_zeros_orig, (n_unique_z,n_unique_x), prior, w_inv, theta_inv, emd, cos_sims, consistency_achieved, suboptimalitygaps_in, suboptimalitygaps_out
 
 
-executions = []
-for seed in range(10):#5):
-    for gamma in ["l_1"]:
-        for R in [50]:#[1,5,10,20,30,50,100]:#5,10,15,20,25,30]:
-             
-            R_test = 100
-            timelimit = 1200#600
-            solve_to = "feasibility" # "feasibility" or "optimality"
-            objfun = "min_distideal" # "min_distideal" or "min_nonzeros"
-            general_case = True
-            sparsity_constraints = None
+N_test = 100
+n_market = 6
+pista=True
+sparse_model = True
+what_in_context = "past_t-1"
 
-            nombre= str(R)+"-"+gamma+"-"+solve_to+"-"+objfun+"-"+str(sparsity_constraints)+"-"+str(general_case)
+gamma="l_2"
+tol=0.005
 
-            instances, model, B_tilde = executeIO_with_parameters(seed, R,R_test,gamma, timelimit,objfun, solve_to,sparsity_constraints, general_case)
+results = []
+dicts = []
+for seed in [123,456,789]:#[123,456,789]:
+    for N in [1]:#[25,50,100,150,200]:
+        for n_stocks in [5]:
+            for objfun in [{1.: "min_prior"},
+                           {0.9: "min_prior", .1:"max_sparsity"}]:#,,
+                           #{0.8: "min_prior", .2:"max_sparsity"}]:
+                
             
-            dict_execution = {'seed': seed, 'R': R, 
-                              'R_test': R_test, 'timelimit':timelimit,
-                              'instances': instances,
-                              'model_status': model.status, 'total_time': model.Runtime,
-                              'model_solcount': model.SolCount, 'solutions': {}}
-            n_j,n,k=instances[:3]
-            caract_instances = 'n='+str(n_j)+'_k='+str(k)
-            # Retrieve the solutions found
-            if model.SolCount > 0: #puede ser solved to optimality o time limit habiendo encontrado alguna sol factible
-                dict_execution  = retrieve_solutions(instances, model, B_tilde, dict_execution)
+                with open('results_dicts_SPARSITY.pkl', 'wb') as f:
+                    pickle.dump((results,dicts), f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-                #NUEVO
-                if general_case:
-                    eta_obtained = np.zeros((n,k))
-                    for i in range(n):
-                      for j in range(k):
-                        eta_obtained[i,j] = model.getVarByName('eta[%d,%d]'%(i,j)).X
-                    eta_obtained
-                    clusters = {}
-                    for j in range(k):
-                        clusters['B_'+str(j+1)] = ['x_'+str(i+1) for i in range(n) if eta_obtained[i,j]==1 ]
+                print("SETING: ",seed,N_test,n_market,N,pista,n_stocks)
 
-                    f = open("CLUSTERS-"+caract_instances+'__'+nombre+".txt", "a")
-                    f.write(str(clusters)+'\n')
-                    f.close()
+                outputs = executeIO(seed, N, N_test, n_stocks, n_market, 
+                                    objfun = objfun, 
+                                    gamma=gamma, tol=tol,
+                                    what_in_context=what_in_context, pista = pista,
+                                    start = "2023-01-01", sparse_model=sparse_model)
+                results.append(outputs)
+                tiempo, MIP_gap, instances, percentage_zeros_orig, (n_unique_z,n_unique_x), prior, w_inv, theta_inv, emd, cos_sims, consistency_achieved, suboptimalitygaps_in, suboptimalitygaps_out = outputs
+                (data_final, stocks, market_features), (d_x,d_x_k,d_z,m,K), (w_orig,theta_orig), (list_A,b), (x,x_test), (optimal_z,optimal_z_test), (opt_criteriawise_v,opt_criteriawise_v_test) = instances.values()    
+                
+                med_in = np.nanmedian([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_in])
+                med_out = np.nanmedian([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_out])
+                mean_in = np.nanmean([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_in])
+                mean_out = np.nanmean([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_out])
+                std_in = np.std([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_in])
+                std_out = np.std([aux.compute_gap(a,b) for (a,b) in suboptimalitygaps_out])
+     
 
+                zeros_orig = (np.sum(w_inv[0]*theta_orig[0]==0)-d_z)#/np.prod(theta_orig[0].shape)
+                zeros_results = (np.sum(w_inv[0]*theta_inv[0]==0)-d_z)#/np.prod(theta_orig[0].shape)
 
-                dict_execution['solutions_dataframe'] = pd.DataFrame(dict_execution['solutions'].values()).drop(['suboptimalitygaps_in','suboptimalitygaps_out'],axis=1)
-            else:
-                dict_execution['solutions_dataframe'] = pd.DataFrame(dict_execution['solutions'].values())
-            executions.append(dict_execution)
+                print("RESULTS: ", emd, cos_sims, consistency_achieved, suboptimalitygaps_in, suboptimalitygaps_out)
+
+                dict = {'seed': seed, 'objfun':objfun, 'N':N, 'n_stocks':n_stocks, 'tiempo':tiempo, 'MIP_gap':MIP_gap, 'percentage_zeros_orig':percentage_zeros_orig, 'n_unique':(n_unique_z,n_unique_x), 
+                        'emd':emd, 'cos_sims':cos_sims, #cos_sims = (mean,std,median)
+                        'consistency':consistency_achieved,
+                        'suboptimalitygaps_in':(mean_in,std_in,med_in), 
+                        'suboptimalitygaps_out':(mean_out,std_out,med_out),
+                        'zeros_orig': zeros_orig, 'zeros_results':zeros_results}
+                dicts.append(dict)
+
             
-            
-            with open(caract_instances+'__'+nombre+'.pkl', 'wb') as handle:
-                pickle.dump(executions, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+########################################
 
 
-# Permanently changes the pandas settings
-pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
-pd.set_option('display.width', None)
+pd.set_option('display.precision', 3)
 
 
-print('\n\n-------------------\n\n')
-"""
-executions = []
-for element in os.listdir():
-    if ("executions.pkl" in element):
-        print(element)
-        with open(element, 'rb') as handle:
-            archivo = pickle.load(handle)
-            executions+=archivo
-"""
-ex_dataframe = pd.DataFrame(executions)
+with open('results_dicts_l2.pkl', 'rb') as f:
+   (results,dicts) = pickle.load(f)
 
-for i in range(ex_dataframe.shape[0]):
-    general_experiment = ex_dataframe.drop(['solutions','instances','solutions_dataframe'],axis=1).loc[i,:]
-    print("\nGENERAL EXPERIMENT: \n", general_experiment)
-    try:
-        solutions = ex_dataframe.loc[i,'solutions_dataframe'].round(2)
-        print("\nSOLUTIONS: \n", solutions)
-    except:
-        print("No solution found in this experiment")
+
+
+
+
+d = pd.DataFrame(dicts)
+d['cos_sims'] = d['cos_sims'].apply(lambda x: x[0])
+
+d.to_excel('dicts_results.xlsx')
